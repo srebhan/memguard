@@ -1,6 +1,7 @@
 package memguard
 
 import (
+	"github.com/awnumar/memcall"
 	"github.com/awnumar/memguard/core"
 )
 
@@ -41,4 +42,8 @@ SafeExit destroys everything sensitive before exiting with a specified status co
 */
 func SafeExit(c int) {
 	core.Exit(c)
+}
+
+func init() {
+	memcall.DisableCoreDumps()
 }
