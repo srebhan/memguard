@@ -9,7 +9,6 @@ import (
 	"unsafe"
 
 	"github.com/awnumar/memcall"
-	"github.com/awnumar/memguard/core"
 )
 
 var buffers = new(bufferList)
@@ -44,7 +43,7 @@ type LockedBuffer struct {
 	canary []byte // Value written behind data to detect spillage
 }
 
-// Constructs a LockedBuffer object from a core.Buffer while also setting up the finalizer for it.
+// Constructs a LockedBuffer object from a Buffer while also setting up the finalizer for it.
 func (buf *LockedBuffer) copy() *LockedBuffer {
 	return &LockedBuffer{
 		alive:     buf.alive,
@@ -69,7 +68,7 @@ NewBuffer creates a mutable data container of the specified size.
 func NewBuffer(size int) *LockedBuffer {
 	// Construct a Buffer of the specified size.
 	if size < 1 {
-		core.Panic(ErrNullBuffer)
+		Panic(ErrNullBuffer)
 	}
 
 	var b LockedBuffer
@@ -79,7 +78,7 @@ func NewBuffer(size int) *LockedBuffer {
 	innerLen := roundToPageSize(size)
 	b.memory, err = memcall.Alloc((2 * pageSize) + innerLen)
 	if err != nil {
-		core.Panic(err)
+		Panic(err)
 	}
 
 	// Construct slice reference for data buffer.
@@ -95,22 +94,22 @@ func NewBuffer(size int) *LockedBuffer {
 
 	// Lock the pages that will hold sensitive data.
 	if err := memcall.Lock(b.inner); err != nil {
-		core.Panic(err)
+		Panic(err)
 	}
 
 	// Initialise the canary value and reference regions.
 	if err := Scramble(b.canary); err != nil {
-		core.Panic(err)
+		Panic(err)
 	}
 	Copy(b.preguard, b.canary)
 	Copy(b.postguard, b.canary)
 
 	// Make the guard pages inaccessible.
 	if err := memcall.Protect(b.preguard, memcall.NoAccess()); err != nil {
-		core.Panic(err)
+		Panic(err)
 	}
 	if err := memcall.Protect(b.postguard, memcall.NoAccess()); err != nil {
-		core.Panic(err)
+		Panic(err)
 	}
 
 	// Set remaining properties
@@ -319,7 +318,7 @@ func (b *LockedBuffer) Freeze() {
 	}
 
 	if err := memcall.Protect(b.inner, memcall.ReadOnly()); err != nil {
-		core.Panic(err)
+		Panic(err)
 	}
 	b.mutable = false
 }
@@ -334,7 +333,7 @@ func (b *LockedBuffer) Melt() {
 	}
 
 	if err := memcall.Protect(b.inner, memcall.ReadWrite()); err != nil {
-		core.Panic(err)
+		Panic(err)
 	}
 	b.mutable = true
 }
@@ -417,7 +416,7 @@ func (b *LockedBuffer) Scramble() {
 	b.Lock()
 	defer b.Unlock()
 	if err := Scramble(b.data); err != nil {
-		core.Panic(err)
+		Panic(err)
 	}
 }
 
@@ -442,6 +441,16 @@ func (b *LockedBuffer) Size() int {
 	return len(b.Bytes())
 }
 
+func (b *LockedBuffer) Alive() bool {
+	b.RLock()
+	defer b.RUnlock()
+	return b.alive
+}
+
+func (b *LockedBuffer) Data() []byte {
+	return b.data
+}
+
 /*
 Destroy wipes and frees the underlying memory of a LockedBuffer. The LockedBuffer will not be accessible or usable after this calls is made.
 */
@@ -457,7 +466,7 @@ func (b *LockedBuffer) Destroy() {
 
 	// Make all of the memory readable and writable.
 	if err := memcall.Protect(b.memory, memcall.ReadWrite()); err != nil {
-		core.Panic(err)
+		Panic(err)
 	}
 	b.mutable = true
 
@@ -466,7 +475,7 @@ func (b *LockedBuffer) Destroy() {
 
 	// Verify the canary
 	if !Equal(b.preguard, b.postguard) || !Equal(b.preguard[:len(b.canary)], b.canary) {
-		core.Panic(ErrBufferInvalidCanary)
+		Panic(ErrBufferInvalidCanary)
 	}
 
 	// Wipe the memory.
@@ -474,12 +483,12 @@ func (b *LockedBuffer) Destroy() {
 
 	// Unlock pages locked into memory.
 	if err := memcall.Unlock(b.inner); err != nil {
-		core.Panic(err)
+		Panic(err)
 	}
 
 	// Free all related memory.
 	if err := memcall.Free(b.memory); err != nil {
-		core.Panic(err)
+		Panic(err)
 	}
 
 	// Reset the fields.

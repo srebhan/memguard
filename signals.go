@@ -4,8 +4,6 @@ import (
 	"os"
 	"os/signal"
 	"sync"
-
-	"github.com/awnumar/memguard/core"
 )
 
 var (
@@ -38,7 +36,7 @@ func CatchSignal(f func(os.Signal), signals ...os.Signal) {
 				select {
 				case signal := <-listener:
 					handler(signal)
-					core.Exit(1)
+					Exit(1)
 				case handler = <-sigfunc:
 				}
 			}

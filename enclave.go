@@ -3,8 +3,6 @@ package memguard
 import (
 	"errors"
 	"sync"
-
-	"github.com/awnumar/memguard/core"
 )
 
 var (
@@ -33,6 +31,9 @@ func getKey() *Coffer {
 // ErrNullEnclave is returned when attempting to construct an enclave of size less than one.
 var ErrNullEnclave = errors.New("<memguard::ErrNullEnclave> enclave size must be greater than zero")
 
+// ErrInvalidCypherLen is returned when the cypher text doesn't match the expected length
+var ErrInvalidCypherLen = errors.New("<memguard> ciphertext has invalid length")
+
 /*
 Enclave is a sealed and encrypted container for sensitive data.
 */
@@ -57,13 +58,13 @@ func NewEnclave(src []byte) *Enclave {
 	// Get a view of the key.
 	k, err := getOrCreateKey().View()
 	if err != nil {
-		core.Panic(err)
+		Panic(err)
 	}
 
 	// Encrypt the plaintext.
 	e.ciphertext, err = Encrypt(src, k.data)
 	if err != nil {
-		core.Panic(err) // key is not 32 bytes long
+		Panic(err) // key is not 32 bytes long
 	}
 
 	// Destroy our copy of the key.
@@ -91,7 +92,7 @@ func (e *Enclave) Open() (*LockedBuffer, error) {
 	bufsize := e.Size()
 
 	if bufsize < 1 {
-		core.Panic("<memguard> ciphertext has invalid length") // ciphertext has invalid length
+		Panic(ErrInvalidCypherLen) // ciphertext has invalid length
 	}
 
 	// Allocate a secure Buffer to hold the decrypted data.
