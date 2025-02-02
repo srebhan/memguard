@@ -1,4 +1,4 @@
-package core
+package memguard
 
 import (
 	"errors"
@@ -18,18 +18,18 @@ Coffer is a specialized container for securing highly-sensitive, 32 byte values.
 type Coffer struct {
 	sync.Mutex
 
-	left  *Buffer
-	right *Buffer
+	left  *LockedBuffer
+	right *LockedBuffer
 
-	rand *Buffer
+	rand *LockedBuffer
 }
 
 // NewCoffer is a raw constructor for the *Coffer object.
 func NewCoffer() *Coffer {
 	s := new(Coffer)
-	s.left, _ = NewBuffer(32)
-	s.right, _ = NewBuffer(32)
-	s.rand, _ = NewBuffer(32)
+	s.left = NewBuffer(32)
+	s.right = NewBuffer(32)
+	s.rand = NewBuffer(32)
 
 	s.Init()
 
@@ -55,17 +55,17 @@ func (s *Coffer) Init() error {
 	s.Lock()
 	defer s.Unlock()
 
-	if err := Scramble(s.left.Data()); err != nil {
+	if err := Scramble(s.left.data); err != nil {
 		return err
 	}
-	if err := Scramble(s.right.Data()); err != nil {
+	if err := Scramble(s.right.data); err != nil {
 		return err
 	}
 
 	// left = left XOR hash(right)
-	hr := Hash(s.right.Data())
+	hr := Hash(s.right.data)
 	for i := range hr {
-		s.left.Data()[i] ^= hr[i]
+		s.left.data[i] ^= hr[i]
 	}
 	Wipe(hr)
 
@@ -75,21 +75,21 @@ func (s *Coffer) Init() error {
 /*
 View returns a snapshot of the contents of a Coffer inside a Buffer. As usual the Buffer should be destroyed as soon as possible after use by calling the Destroy method.
 */
-func (s *Coffer) View() (*Buffer, error) {
+func (s *Coffer) View() (*LockedBuffer, error) {
 	if s.Destroyed() {
 		return nil, ErrCofferExpired
 	}
 
-	b, _ := NewBuffer(32)
+	b := NewBuffer(32)
 
 	s.Lock()
 	defer s.Unlock()
 
 	// data = hash(right) XOR left
-	h := Hash(s.right.Data())
+	h := Hash(s.right.data)
 
-	for i := range b.Data() {
-		b.Data()[i] = h[i] ^ s.left.Data()[i]
+	for i := range b.data {
+		b.data[i] = h[i] ^ s.left.data[i]
 	}
 	Wipe(h)
 
@@ -107,22 +107,22 @@ func (s *Coffer) Rekey() error {
 	s.Lock()
 	defer s.Unlock()
 
-	if err := Scramble(s.rand.Data()); err != nil {
+	if err := Scramble(s.rand.data); err != nil {
 		return err
 	}
 
 	// Hash the current right partition for later.
-	hashRightCurrent := Hash(s.right.Data())
+	hashRightCurrent := Hash(s.right.data)
 
 	// new_right = current_right XOR buf32
-	for i := range s.right.Data() {
-		s.right.Data()[i] ^= s.rand.Data()[i]
+	for i := range s.right.data {
+		s.right.data[i] ^= s.rand.data[i]
 	}
 
 	// new_left = current_left XOR hash(current_right) XOR hash(new_right)
-	hashRightNew := Hash(s.right.Data())
-	for i := range s.left.Data() {
-		s.left.Data()[i] ^= hashRightCurrent[i] ^ hashRightNew[i]
+	hashRightNew := Hash(s.right.data)
+	for i := range s.left.data {
+		s.left.data[i] ^= hashRightCurrent[i] ^ hashRightNew[i]
 	}
 	Wipe(hashRightNew)
 
@@ -132,37 +132,13 @@ func (s *Coffer) Rekey() error {
 /*
 Destroy wipes and cleans up all memory related to a Coffer object. Once this method has been called, the Coffer can no longer be used and a new one should be created instead.
 */
-func (s *Coffer) Destroy() error {
+func (s *Coffer) Destroy() {
 	s.Lock()
 	defer s.Unlock()
 
-	err1 := s.left.destroy()
-	if err1 == nil {
-		buffers.remove(s.left)
-	}
-	err2 := s.right.destroy()
-	if err2 == nil {
-		buffers.remove(s.right)
-	}
-	err3 := s.rand.destroy()
-	if err3 == nil {
-		buffers.remove(s.rand)
-	}
-
-	errS := ""
-	if err1 != nil {
-		errS = errS + err1.Error() + "\n"
-	}
-	if err2 != nil {
-		errS = errS + err2.Error() + "\n"
-	}
-	if err3 != nil {
-		errS = errS + err3.Error() + "\n"
-	}
-	if errS == "" {
-		return nil
-	}
-	return errors.New(errS)
+	s.left.Destroy()
+	s.right.Destroy()
+	s.rand.Destroy()
 }
 
 // Destroyed returns a boolean value indicating if a Coffer has been destroyed.

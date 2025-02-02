@@ -5,8 +5,6 @@ import (
 	"io"
 	"os"
 	"sync"
-
-	"github.com/awnumar/memguard/core"
 )
 
 var (
@@ -97,7 +95,7 @@ func (s *Stream) Read(buf []byte) (int, error) {
 	defer b.Destroy()
 
 	// Copy the contents into the given buffer.
-	core.Copy(buf, b.Bytes())
+	Copy(buf, b.Bytes())
 
 	// Check if there is data left over.
 	if len(buf) < b.Size() {

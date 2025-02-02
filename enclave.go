@@ -8,22 +8,22 @@ import (
 )
 
 var (
-	key    = &core.Coffer{}
+	key    = &Coffer{}
 	keyMtx = sync.Mutex{}
 )
 
-func getOrCreateKey() *core.Coffer {
+func getOrCreateKey() *Coffer {
 	keyMtx.Lock()
 	defer keyMtx.Unlock()
 
 	if key.Destroyed() {
-		key = core.NewCoffer()
+		key = NewCoffer()
 	}
 
 	return key
 }
 
-func getKey() *core.Coffer {
+func getKey() *Coffer {
 	keyMtx.Lock()
 	defer keyMtx.Unlock()
 
@@ -61,7 +61,7 @@ func NewEnclave(src []byte) *Enclave {
 	}
 
 	// Encrypt the plaintext.
-	e.ciphertext, err = Encrypt(src, k.Data())
+	e.ciphertext, err = Encrypt(src, k.data)
 	if err != nil {
 		core.Panic(err) // key is not 32 bytes long
 	}
@@ -88,7 +88,7 @@ func NewEnclaveRandom(size int) *Enclave {
 Open decrypts an Enclave object and places its contents into an immutable LockedBuffer. An error will be returned if decryption failed.
 */
 func (e *Enclave) Open() (*LockedBuffer, error) {
-	bufsize := le.Size()
+	bufsize := e.Size()
 
 	if bufsize < 1 {
 		core.Panic("<memguard> ciphertext has invalid length") // ciphertext has invalid length
@@ -105,7 +105,7 @@ func (e *Enclave) Open() (*LockedBuffer, error) {
 
 	// Decrypt the enclave into the buffer we created.
 	b.RLock()
-	if _, err := Decrypt(e.ciphertext, k.Data(), b.data); err != nil {
+	if _, err := Decrypt(e.ciphertext, k.data, b.data); err != nil {
 		b.RUnlock()
 		return nil, err
 	}

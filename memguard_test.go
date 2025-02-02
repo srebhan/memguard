@@ -3,8 +3,6 @@ package memguard
 import (
 	"bytes"
 	"testing"
-
-	"github.com/awnumar/memguard/core"
 )
 
 func TestScrambleBytes(t *testing.T) {
@@ -35,7 +33,7 @@ func TestPurge(t *testing.T) {
 		t.Error("buffer not destroyed")
 	}
 	buf, err = key.Open()
-	if err != core.ErrDecryptionFailed {
+	if err != ErrDecryptionFailed {
 		t.Error(buf.Bytes(), err)
 	}
 	if buf != nil {

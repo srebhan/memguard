@@ -6,8 +6,6 @@ import (
 	"os"
 	"runtime"
 	"testing"
-
-	"github.com/awnumar/memguard/core"
 )
 
 func write(t *testing.T, s *Stream, b []byte) {
@@ -127,7 +125,7 @@ func TestStreamReadWrite(t *testing.T) {
 	ScrambleBytes(data)
 	write(t, s, data)
 	Purge()
-	read(t, s, nil, core.ErrDecryptionFailed)
+	read(t, s, nil, ErrDecryptionFailed)
 }
 
 func TestStreamingSanity(t *testing.T) {
