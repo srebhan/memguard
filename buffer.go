@@ -2,12 +2,26 @@ package memguard
 
 import (
 	"bytes"
+	"errors"
 	"io"
 	"os"
+	"sync"
 	"unsafe"
 
+	"github.com/awnumar/memcall"
 	"github.com/awnumar/memguard/core"
 )
+
+var buffers = new(bufferList)
+
+// ErrNullBuffer is returned when attempting to construct a buffer of size less than one.
+var ErrNullBuffer = errors.New("<memguard::ErrNullBuffer> buffer size must be greater than zero")
+
+// ErrBufferExpired is returned when attempting to perform an operation on or with a buffer that has been destroyed.
+var ErrBufferExpired = errors.New("<memguard::ErrBufferExpired> buffer has been purged from memory and can no longer be used")
+
+// ErrBufferInvalidCanary is returned when the canary after the buffer doesn't match the expectation
+var ErrBufferInvalidCanary = errors.New("<memguard:ErrBufferInvalidCanary> canary verification failed; buffer overflow detected")
 
 /*
 LockedBuffer is a structure that holds raw sensitive data.
@@ -15,17 +29,38 @@ LockedBuffer is a structure that holds raw sensitive data.
 The number of LockedBuffers that you are able to create is limited by how much memory your system's kernel allows each process to mlock/VirtualLock. Therefore you should call Destroy on LockedBuffers that you no longer need or defer a Destroy call after creating a new LockedBuffer.
 */
 type LockedBuffer struct {
-	*core.Buffer
+	sync.RWMutex // Local mutex lock // TODO: this does not protect 'data' field
+
+	alive   bool // Signals that destruction has not come
+	mutable bool // Mutability state of underlying memory
+
+	data   []byte // Portion of memory holding the data
+	memory []byte // Entire allocated memory region
+
+	preguard  []byte // Guard page addressed before the data
+	inner     []byte // Inner region between the guard pages
+	postguard []byte // Guard page addressed after the data
+
+	canary []byte // Value written behind data to detect spillage
 }
 
 // Constructs a LockedBuffer object from a core.Buffer while also setting up the finalizer for it.
-func newBuffer(buf *core.Buffer) *LockedBuffer {
-	return &LockedBuffer{buf}
+func (buf *LockedBuffer) copy() *LockedBuffer {
+	return &LockedBuffer{
+		alive:     buf.alive,
+		mutable:   buf.mutable,
+		data:      buf.data,
+		memory:    buf.memory,
+		preguard:  buf.preguard,
+		inner:     buf.inner,
+		postguard: buf.postguard,
+		canary:    buf.canary,
+	}
 }
 
 // Constructs a quasi-destroyed LockedBuffer with size zero.
 func newNullBuffer() *LockedBuffer {
-	return &LockedBuffer{new(core.Buffer)}
+	return &LockedBuffer{}
 }
 
 /*
@@ -33,13 +68,60 @@ NewBuffer creates a mutable data container of the specified size.
 */
 func NewBuffer(size int) *LockedBuffer {
 	// Construct a Buffer of the specified size.
-	buf, err := core.NewBuffer(size)
-	if err != nil {
-		return newNullBuffer()
+	if size < 1 {
+		core.Panic(ErrNullBuffer)
 	}
 
-	// Construct and return the wrapped container object.
-	return newBuffer(buf)
+	var b LockedBuffer
+	var err error
+
+	// Allocate the total needed memory
+	innerLen := roundToPageSize(size)
+	b.memory, err = memcall.Alloc((2 * pageSize) + innerLen)
+	if err != nil {
+		core.Panic(err)
+	}
+
+	// Construct slice reference for data buffer.
+	b.data = getBytes(&b.memory[pageSize+innerLen-size], size)
+
+	// Construct slice references for page sectors.
+	b.preguard = getBytes(&b.memory[0], pageSize)
+	b.inner = getBytes(&b.memory[pageSize], innerLen)
+	b.postguard = getBytes(&b.memory[pageSize+innerLen], pageSize)
+
+	// Construct slice reference for canary portion of inner page.
+	b.canary = getBytes(&b.memory[pageSize], len(b.inner)-len(b.data))
+
+	// Lock the pages that will hold sensitive data.
+	if err := memcall.Lock(b.inner); err != nil {
+		core.Panic(err)
+	}
+
+	// Initialise the canary value and reference regions.
+	if err := Scramble(b.canary); err != nil {
+		core.Panic(err)
+	}
+	Copy(b.preguard, b.canary)
+	Copy(b.postguard, b.canary)
+
+	// Make the guard pages inaccessible.
+	if err := memcall.Protect(b.preguard, memcall.NoAccess()); err != nil {
+		core.Panic(err)
+	}
+	if err := memcall.Protect(b.postguard, memcall.NoAccess()); err != nil {
+		core.Panic(err)
+	}
+
+	// Set remaining properties
+	b.alive = true
+	b.mutable = true
+
+	// Append the container to list of active buffers.
+	buffers.add(&b)
+
+	// Return the created Buffer to the caller.
+	return &b
 }
 
 /*
@@ -229,12 +311,32 @@ func NewBufferRandom(size int) *LockedBuffer {
 
 // Freeze makes a LockedBuffer's memory immutable. The call can be reversed with Melt.
 func (b *LockedBuffer) Freeze() {
-	b.Buffer.Freeze()
+	b.Lock()
+	defer b.Unlock()
+
+	if !b.alive || !b.mutable {
+		return
+	}
+
+	if err := memcall.Protect(b.inner, memcall.ReadOnly()); err != nil {
+		core.Panic(err)
+	}
+	b.mutable = false
 }
 
 // Melt makes a LockedBuffer's memory mutable. The call can be reversed with Freeze.
 func (b *LockedBuffer) Melt() {
-	b.Buffer.Melt()
+	b.Lock()
+	defer b.Unlock()
+
+	if !b.alive || b.mutable {
+		return
+	}
+
+	if err := memcall.Protect(b.inner, memcall.ReadWrite()); err != nil {
+		core.Panic(err)
+	}
+	b.mutable = true
 }
 
 /*
@@ -243,9 +345,9 @@ Seal takes a LockedBuffer object and returns its contents encrypted inside a sea
 If Seal is called on a destroyed buffer, a nil enclave is returned.
 */
 func (b *LockedBuffer) Seal() *Enclave {
-	e, err := core.Seal(b.Buffer)
+	e, err := core.Seal(b)
 	if err != nil {
-		if err == core.ErrBufferExpired {
+		if err == ErrBufferExpired {
 			return nil
 		}
 		core.Panic(err)
@@ -271,7 +373,7 @@ func (b *LockedBuffer) CopyAt(offset int, src []byte) {
 	b.Lock()
 	defer b.Unlock()
 
-	core.Copy(b.Bytes()[offset:], src)
+	Copy(b.Bytes()[offset:], src)
 }
 
 /*
@@ -292,7 +394,7 @@ func (b *LockedBuffer) MoveAt(offset int, src []byte) {
 	b.Lock()
 	defer b.Unlock()
 
-	core.Move(b.Bytes()[offset:], src)
+	Move(b.Bytes()[offset:], src)
 }
 
 /*
@@ -303,7 +405,11 @@ func (b *LockedBuffer) Scramble() {
 		return
 	}
 
-	b.Buffer.Scramble()
+	b.Lock()
+	defer b.Unlock()
+	if err := Scramble(b.data); err != nil {
+		core.Panic(err)
+	}
 }
 
 /*
@@ -317,7 +423,7 @@ func (b *LockedBuffer) Wipe() {
 	b.Lock()
 	defer b.Unlock()
 
-	core.Wipe(b.Bytes())
+	Wipe(b.Bytes())
 }
 
 /*
@@ -331,21 +437,71 @@ func (b *LockedBuffer) Size() int {
 Destroy wipes and frees the underlying memory of a LockedBuffer. The LockedBuffer will not be accessible or usable after this calls is made.
 */
 func (b *LockedBuffer) Destroy() {
-	b.Buffer.Destroy()
+	// Attain a mutex lock on this Buffer.
+	b.Lock()
+	defer b.Unlock()
+
+	// Return if it's already destroyed.
+	if !b.alive {
+		return
+	}
+
+	// Make all of the memory readable and writable.
+	if err := memcall.Protect(b.memory, memcall.ReadWrite()); err != nil {
+		core.Panic(err)
+	}
+	b.mutable = true
+
+	// Wipe data field.
+	Wipe(b.data)
+
+	// Verify the canary
+	if !Equal(b.preguard, b.postguard) || !Equal(b.preguard[:len(b.canary)], b.canary) {
+		core.Panic(ErrBufferInvalidCanary)
+	}
+
+	// Wipe the memory.
+	Wipe(b.memory)
+
+	// Unlock pages locked into memory.
+	if err := memcall.Unlock(b.inner); err != nil {
+		core.Panic(err)
+	}
+
+	// Free all related memory.
+	if err := memcall.Free(b.memory); err != nil {
+		core.Panic(err)
+	}
+
+	// Reset the fields.
+	b.alive = false
+	b.mutable = false
+	b.data = nil
+	b.memory = nil
+	b.preguard = nil
+	b.inner = nil
+	b.postguard = nil
+	b.canary = nil
+
+	buffers.remove(b)
 }
 
 /*
 IsAlive returns a boolean value indicating if a LockedBuffer is alive, i.e. that it has not been destroyed.
 */
 func (b *LockedBuffer) IsAlive() bool {
-	return b.Buffer.Alive()
+	b.RLock()
+	defer b.RUnlock()
+	return b.alive
 }
 
 /*
 IsMutable returns a boolean value indicating if a LockedBuffer is mutable.
 */
 func (b *LockedBuffer) IsMutable() bool {
-	return b.Buffer.Mutable()
+	b.RLock()
+	defer b.RUnlock()
+	return b.mutable
 }
 
 /*
@@ -355,7 +511,7 @@ func (b *LockedBuffer) EqualTo(buf []byte) bool {
 	b.RLock()
 	defer b.RUnlock()
 
-	return core.Equal(b.Bytes(), buf)
+	return Equal(b.Bytes(), buf)
 }
 
 /*
@@ -366,7 +522,7 @@ func (b *LockedBuffer) EqualTo(buf []byte) bool {
 Bytes returns a byte slice referencing the protected region of memory.
 */
 func (b *LockedBuffer) Bytes() []byte {
-	return b.Buffer.Data()
+	return b.data
 }
 
 /*
@@ -390,14 +546,13 @@ Uint16 returns a slice pointing to the protected region of memory with the data 
 If called on a destroyed LockedBuffer, a nil slice will be returned.
 */
 func (b *LockedBuffer) Uint16() []uint16 {
-
-	// Check if still alive.
-	if !b.Buffer.Alive() {
-		return nil
-	}
-
 	b.RLock()
 	defer b.RUnlock()
+
+	// Check if still alive.
+	if !b.alive {
+		return nil
+	}
 
 	// Compute size of new slice representation.
 	size := b.Size() / 2
@@ -422,14 +577,13 @@ Uint32 returns a slice pointing to the protected region of memory with the data 
 If called on a destroyed LockedBuffer, a nil slice will be returned.
 */
 func (b *LockedBuffer) Uint32() []uint32 {
-
-	// Check if still alive.
-	if !b.Buffer.Alive() {
-		return nil
-	}
-
 	b.RLock()
 	defer b.RUnlock()
+
+	// Check if still alive.
+	if !b.alive {
+		return nil
+	}
 
 	// Compute size of new slice representation.
 	size := b.Size() / 4
@@ -454,14 +608,13 @@ Uint64 returns a slice pointing to the protected region of memory with the data 
 If called on a destroyed LockedBuffer, a nil slice will be returned.
 */
 func (b *LockedBuffer) Uint64() []uint64 {
-
-	// Check if still alive.
-	if !b.Buffer.Alive() {
-		return nil
-	}
-
 	b.RLock()
 	defer b.RUnlock()
+
+	// Check if still alive.
+	if !b.alive {
+		return nil
+	}
 
 	// Compute size of new slice representation.
 	size := b.Size() / 8
@@ -484,14 +637,13 @@ func (b *LockedBuffer) Uint64() []uint64 {
 Int8 returns a slice pointing to the protected region of memory with the data represented as a sequence of signed 8 bit integers. If called on a destroyed LockedBuffer, a nil slice will be returned.
 */
 func (b *LockedBuffer) Int8() []int8 {
-
-	// Check if still alive.
-	if !b.Buffer.Alive() {
-		return nil
-	}
-
 	b.RLock()
 	defer b.RUnlock()
+
+	// Check if still alive.
+	if !b.alive {
+		return nil
+	}
 
 	// Construct the new slice representation.
 	var sl = struct {
@@ -510,14 +662,13 @@ Int16 returns a slice pointing to the protected region of memory with the data r
 If called on a destroyed LockedBuffer, a nil slice will be returned.
 */
 func (b *LockedBuffer) Int16() []int16 {
-
-	// Check if still alive.
-	if !b.Buffer.Alive() {
-		return nil
-	}
-
 	b.RLock()
 	defer b.RUnlock()
+
+	// Check if still alive.
+	if !b.alive {
+		return nil
+	}
 
 	// Compute size of new slice representation.
 	size := b.Size() / 2
@@ -542,14 +693,13 @@ Int32 returns a slice pointing to the protected region of memory with the data r
 If called on a destroyed LockedBuffer, a nil slice will be returned.
 */
 func (b *LockedBuffer) Int32() []int32 {
-
-	// Check if still alive.
-	if !b.Buffer.Alive() {
-		return nil
-	}
-
 	b.RLock()
 	defer b.RUnlock()
+
+	// Check if still alive.
+	if !b.alive {
+		return nil
+	}
 
 	// Compute size of new slice representation.
 	size := b.Size() / 4
@@ -574,14 +724,13 @@ Int64 returns a slice pointing to the protected region of memory with the data r
 If called on a destroyed LockedBuffer, a nil slice will be returned.
 */
 func (b *LockedBuffer) Int64() []int64 {
-
-	// Check if still alive.
-	if !b.Buffer.Alive() {
-		return nil
-	}
-
 	b.RLock()
 	defer b.RUnlock()
+
+	// Check if still alive.
+	if !b.alive {
+		return nil
+	}
 
 	// Compute size of new slice representation.
 	size := b.Size() / 8
@@ -606,14 +755,13 @@ ByteArray8 returns a pointer to some 8 byte array. Care must be taken not to der
 The length of the buffer must be at least 8 bytes in size and the LockedBuffer should not be destroyed. In either of these cases a nil value is returned.
 */
 func (b *LockedBuffer) ByteArray8() *[8]byte {
-
-	// Check if still alive.
-	if !b.Buffer.Alive() {
-		return nil
-	}
-
 	b.RLock()
 	defer b.RUnlock()
+
+	// Check if still alive.
+	if !b.alive {
+		return nil
+	}
 
 	// Check if the length is large enough.
 	if len(b.Bytes()) < 8 {
@@ -630,14 +778,13 @@ ByteArray16 returns a pointer to some 16 byte array. Care must be taken not to d
 The length of the buffer must be at least 16 bytes in size and the LockedBuffer should not be destroyed. In either of these cases a nil value is returned.
 */
 func (b *LockedBuffer) ByteArray16() *[16]byte {
-
-	// Check if still alive.
-	if !b.Buffer.Alive() {
-		return nil
-	}
-
 	b.RLock()
 	defer b.RUnlock()
+
+	// Check if still alive.
+	if !b.alive {
+		return nil
+	}
 
 	// Check if the length is large enough.
 	if len(b.Bytes()) < 16 {
@@ -654,14 +801,13 @@ ByteArray32 returns a pointer to some 32 byte array. Care must be taken not to d
 The length of the buffer must be at least 32 bytes in size and the LockedBuffer should not be destroyed. In either of these cases a nil value is returned.
 */
 func (b *LockedBuffer) ByteArray32() *[32]byte {
-
-	// Check if still alive.
-	if !b.Buffer.Alive() {
-		return nil
-	}
-
 	b.RLock()
 	defer b.RUnlock()
+
+	// Check if still alive.
+	if !b.alive {
+		return nil
+	}
 
 	// Check if the length is large enough.
 	if len(b.Bytes()) < 32 {
@@ -678,14 +824,13 @@ ByteArray64 returns a pointer to some 64 byte array. Care must be taken not to d
 The length of the buffer must be at least 64 bytes in size and the LockedBuffer should not be destroyed. In either of these cases a nil value is returned.
 */
 func (b *LockedBuffer) ByteArray64() *[64]byte {
-
-	// Check if still alive.
-	if !b.Buffer.Alive() {
-		return nil
-	}
-
 	b.RLock()
 	defer b.RUnlock()
+
+	// Check if still alive.
+	if !b.alive {
+		return nil
+	}
 
 	// Check if the length is large enough.
 	if len(b.Bytes()) < 64 {

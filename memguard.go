@@ -11,7 +11,7 @@ import (
 ScrambleBytes overwrites an arbitrary buffer with cryptographically-secure random bytes.
 */
 func ScrambleBytes(buf []byte) {
-	if err := core.Scramble(buf); err != nil {
+	if err := Scramble(buf); err != nil {
 		core.Panic(err)
 	}
 }
@@ -20,7 +20,7 @@ func ScrambleBytes(buf []byte) {
 WipeBytes overwrites an arbitrary buffer with zeroes.
 */
 func WipeBytes(buf []byte) {
-	core.Wipe(buf)
+	Wipe(buf)
 }
 
 /*
