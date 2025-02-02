@@ -345,14 +345,23 @@ Seal takes a LockedBuffer object and returns its contents encrypted inside a sea
 If Seal is called on a destroyed buffer, a nil enclave is returned.
 */
 func (b *LockedBuffer) Seal() *Enclave {
-	e, err := core.Seal(b)
-	if err != nil {
-		if err == ErrBufferExpired {
-			return nil
-		}
-		core.Panic(err)
+	// Check if the Buffer has been destroyed.
+	if !b.alive {
+		return nil
 	}
-	return &Enclave{e}
+
+	b.Melt() // Make the buffer mutable so that we can wipe it.
+
+	// Construct the Enclave from the Buffer's data.
+	b.RLock() // Attain a read lock.
+	e := NewEnclave(b.data)
+	b.RUnlock()
+
+	// Destroy the Buffer object.
+	b.Destroy()
+
+	// Return the newly created Enclave.
+	return e
 }
 
 /*

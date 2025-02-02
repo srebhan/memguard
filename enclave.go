@@ -1,14 +1,43 @@
 package memguard
 
 import (
+	"errors"
+	"sync"
+
 	"github.com/awnumar/memguard/core"
 )
+
+var (
+	key    = &core.Coffer{}
+	keyMtx = sync.Mutex{}
+)
+
+func getOrCreateKey() *core.Coffer {
+	keyMtx.Lock()
+	defer keyMtx.Unlock()
+
+	if key.Destroyed() {
+		key = core.NewCoffer()
+	}
+
+	return key
+}
+
+func getKey() *core.Coffer {
+	keyMtx.Lock()
+	defer keyMtx.Unlock()
+
+	return key
+}
+
+// ErrNullEnclave is returned when attempting to construct an enclave of size less than one.
+var ErrNullEnclave = errors.New("<memguard::ErrNullEnclave> enclave size must be greater than zero")
 
 /*
 Enclave is a sealed and encrypted container for sensitive data.
 */
 type Enclave struct {
-	*core.Enclave
+	ciphertext []byte
 }
 
 /*
@@ -17,14 +46,33 @@ NewEnclave seals up some data into an encrypted enclave object. The buffer is wi
 A LockedBuffer may alternatively be converted into an Enclave object using its Seal method. This will also have the effect of destroying the LockedBuffer.
 */
 func NewEnclave(src []byte) *Enclave {
-	e, err := core.NewEnclave(src)
+	// Return an error if length < 1.
+	if len(src) < 1 {
+		return nil
+	}
+
+	// Create a new Enclave.
+	var e Enclave
+
+	// Get a view of the key.
+	k, err := getOrCreateKey().View()
 	if err != nil {
-		if err == core.ErrNullEnclave {
-			return nil
-		}
 		core.Panic(err)
 	}
-	return &Enclave{e}
+
+	// Encrypt the plaintext.
+	e.ciphertext, err = Encrypt(src, k.Data())
+	if err != nil {
+		core.Panic(err) // key is not 32 bytes long
+	}
+
+	// Destroy our copy of the key.
+	k.Destroy()
+
+	// Wipe the given buffer.
+	Wipe(src)
+
+	return &e
 }
 
 /*
@@ -40,20 +88,40 @@ func NewEnclaveRandom(size int) *Enclave {
 Open decrypts an Enclave object and places its contents into an immutable LockedBuffer. An error will be returned if decryption failed.
 */
 func (e *Enclave) Open() (*LockedBuffer, error) {
-	b, err := core.Open(e.Enclave)
+	bufsize := le.Size()
+
+	if bufsize < 1 {
+		core.Panic("<memguard> ciphertext has invalid length") // ciphertext has invalid length
+	}
+
+	// Allocate a secure Buffer to hold the decrypted data.
+	b := NewBuffer(bufsize)
+
+	// Grab a view of the key.
+	k, err := getOrCreateKey().View()
 	if err != nil {
-		if err != core.ErrDecryptionFailed {
-			core.Panic(err)
-		}
 		return nil, err
 	}
+
+	// Decrypt the enclave into the buffer we created.
+	b.RLock()
+	if _, err := Decrypt(e.ciphertext, k.Data(), b.data); err != nil {
+		b.RUnlock()
+		return nil, err
+	}
+	b.RUnlock()
+
+	// Destroy our copy of the key.
+	k.Destroy()
+
 	b.Freeze()
-	return newBuffer(b), nil
+
+	return b, nil
 }
 
 /*
 Size returns the number of bytes of data stored within an Enclave.
 */
 func (e *Enclave) Size() int {
-	return core.EnclaveSize(e.Enclave)
+	return len(e.ciphertext) - Overhead
 }
